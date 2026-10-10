@@ -1,0 +1,22 @@
+# Example only: place this in an application repository, not in vps-kit.
+# Buildable services are published by GitHub Actions to GHCR with immutable SHA tags.
+services:
+  web:
+    build:
+      context: ./web
+    ports:
+      - "127.0.0.1:8081:80" # match: vpsctl project add example --port 8081
+    restart: unless-stopped
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_DB: app
+      POSTGRES_PASSWORD: "${DB_PASSWORD:?Set DB_PASSWORD in production .env}"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  db-data:

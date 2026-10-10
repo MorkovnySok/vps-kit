@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+while (($#)); do
+  if [[ "$1" == '-f' ]]; then
+    target="$2"; break
+  fi
+  shift
+done
+printf 'FAKE_KEY_FOR_TEST_ONLY\n' > "$target"
+printf 'ssh-ed25519 TEST_PUBLIC_KEY testing\n' > "$target.pub"
