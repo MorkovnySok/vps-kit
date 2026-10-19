@@ -454,6 +454,75 @@ jobs:
 '''
 
 
+def project_rm(a):
+    needs_root()
+    p = read_project(a.slug)
+    slug = p['slug']
+
+    if not a.no_confirm:
+        confirm = choose(f'Удалить проект {slug} ({p["repo"]})?', ['Удалить', 'Отмена'])
+        if confirm == 1:
+            print('Отменено.')
+            return 0
+
+    caddy = p.get('caddy', True)
+    key = KEY_DIR / f'{slug}.key'
+    pub = key.with_suffix('.key.pub')
+    site = CADDY_DIR / f'{slug}.caddy'
+    metadata = PROJECT_DIR / f'{slug}.json'
+    auth_line_pattern = f'command="{RECEIVER} {slug}",restrict '
+    base = APPS_DIR / slug
+    env = base / 'shared' / '.env'
+    caddy_reloaded = False
+
+    # Remove authorized_keys entry
+    if AUTH_KEYS.exists():
+        try:
+            lines = AUTH_KEYS.read_text().splitlines(keepends=True)
+            filtered = [l for l in lines if auth_line_pattern not in l]
+            if len(filtered) != len(lines):
+                AUTH_KEYS.write_text(''.join(filtered))
+            else:
+                print(f'  строка с ключом {slug} в authorized_keys не найдена.')
+        except OSError as e:
+            print(f'  предупреждение: не удалось обновить authorized_keys: {e}', file=sys.stderr)
+
+    # Remove SSH key pair
+    for k in [key, pub]:
+        if k.exists():
+            k.unlink()
+            print(f'  удалён ключ: {k}')
+
+    # Remove Caddy site file
+    if caddy and site.exists():
+        site.unlink()
+        print(f'  удалён сайт Caddy: {site}')
+        caddy_reloaded = True
+
+    # Remove metadata
+    if metadata.exists():
+        metadata.unlink()
+        print(f'  удалён метаданные: {metadata}')
+
+    # Remove app directory (base + all contents)
+    if base.exists():
+        try:
+            shutil.rmtree(str(base))
+            print(f'  удалён каталог приложения: {base}')
+        except OSError as e:
+            print(f'  предупреждение: не удалось удалить {base}: {e}', file=sys.stderr)
+
+    # Reload Caddy if needed
+    if caddy_reloaded:
+        try:
+            run('systemctl', 'reload', 'caddy')
+            print('  Caddy перезапущен.')
+        except subprocess.CalledProcessError as e:
+            print(f'  предупреждение: не удалось перезагрузить Caddy: {e}', file=sys.stderr)
+
+    print(f'\nПроект {slug} удалён.')
+
+
 def project_workflow(a):
     p = read_project(a.slug)
     text = workflow_text(p)
@@ -618,6 +687,20 @@ def build_parser():
     add.add_argument('--no-caddy', action='store_true', help='не создавать сайт Caddy; маршрутизацию настроить вручную')
     add.add_argument('-i', '--interactive', action='store_true', help='открыть мастер даже при указанных параметрах; они станут начальными ответами')
     add.set_defaults(fn=project_add)
+    rm = parser(ps, 'rm', 'Удалить проект', 'Удаляет все артефакты проекта: метаданные, SSH-ключ, сайт Caddy, каталог приложения. Нужен sudo.',
+                 '''Примеры:
+sudo vpsctl project rm myapp
+sudo vpsctl project rm myapp --no-confirm
+
+Удаляет:
+  - /etc/vps-kit/projects/<slug>.json
+  - /etc/caddy/vps-kit/<slug>.caddy (если был создан)
+  - SSH-ключ из authorized_keys и пару в pending-keys
+  - /opt/apps/<slug>/ (с env и RELEASES)
+Перед удалением запрашивается подтверждение. С --no-confirm — без запроса.''', ('project', 'rm'))
+    rm.add_argument('slug', help='имя проекта на VPS')
+    rm.add_argument('--no-confirm', action='store_true', help='удалить без запроса подтверждения')
+    rm.set_defaults(fn=project_rm)
     wf = parser(sub, 'workflow', 'Сгенерировать GitHub Actions workflow',
                 'Генерирует YAML для репозитория приложения. С именем проекта без --output выводит только YAML в stdout.\nБез имени в терминале предлагает выбрать проект. Сам не делает commit/push и не запускает деплой.',
                 '''Примеры:
@@ -681,8 +764,8 @@ def main_menu(ap):
     print('vps-kit — приложения на твоём VPS')
     while True:
         action = choose('Что сделать?', ['Добавить проект', 'Настроить GitHub Secrets', 'Сохранить workflow',
-                                         'Войти в GHCR', 'Показать состояние', 'Проверить VPS', 'Справка', 'Выход'])
-        if action == 7:
+                                         'Войти в GHCR', 'Показать состояние', 'Проверить VPS', 'Справка', 'Удалить проект', 'Выход'])
+        if action == 8:
             return 0
         try:
             if action == 0:
@@ -709,6 +792,9 @@ def main_menu(ap):
                 doctor(None)
             elif action == 6:
                 ap.print_help()
+            elif action == 7:
+                slug = select_project()
+                project_rm(argparse.Namespace(slug=slug, no_confirm=False))
         except SystemExit as e:
             print(e, file=sys.stderr)
         except (WizardCancelled, EOFError, KeyboardInterrupt):
@@ -737,6 +823,11 @@ def main():
                 ap.error('нужны имя проекта, --repo и --port. Для мастера в терминале: sudo vpsctl project add')
             args.compose = args.compose or 'compose.yaml'
             args.branch = args.branch or 'main'
+        elif args.command == 'project' and args.action == 'rm':
+            if args.slug is None:
+                if not is_interactive():
+                    ap.error('укажи имя проекта. Список: vpsctl status')
+                args.slug = select_project()
         elif args.command == 'workflow' or (args.command == 'github' and args.action == 'configure'):
             if args.slug is None:
                 if not is_interactive():
