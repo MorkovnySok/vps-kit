@@ -12,6 +12,16 @@ root.mkdir(parents=True, exist_ok=True)
 MAX_FILES = 25000
 MAX_TOTAL = 2 * 1024 * 1024 * 1024
 count = total = 0
+directory_modes = {}
+
+
+def make_directories(path):
+    # The receiver uses umask 077. Record implicit parents too, so bind-mounted
+    # directories remain traversable by container users after extraction.
+    for parent in [*reversed(path.parents), path]:
+        if parent != root and parent.is_relative_to(root) and not parent.exists():
+            parent.mkdir()
+            directory_modes[parent] = 0o755
 
 with tarfile.open(fileobj=sys.stdin.buffer, mode='r|gz') as archive:
     for item in archive:
@@ -30,13 +40,17 @@ with tarfile.open(fileobj=sys.stdin.buffer, mode='r|gz') as archive:
         if not dest.is_relative_to(root):
             raise SystemExit(f'archive path escapes extraction root: {item.name!r}')
         if item.isdir():
-            dest.mkdir(parents=True, exist_ok=True)
+            make_directories(dest)
+            if dest != root:
+                directory_modes[dest] = item.mode & 0o777
         else:
-            dest.parent.mkdir(parents=True, exist_ok=True)
+            make_directories(dest.parent)
             source = archive.extractfile(item)
             if source is None:
                 raise SystemExit(f'could not extract {item.name!r}')
             with source, dest.open('xb') as output:
                 shutil.copyfileobj(source, output, length=1024*1024)
             dest.chmod(item.mode & 0o777)  # executable bits are useful for Docker builds
+for directory in sorted(directory_modes, key=lambda p: len(p.parts), reverse=True):
+    directory.chmod(directory_modes[directory])
 print(f'extracted {count} entries, {total} bytes', file=sys.stderr)

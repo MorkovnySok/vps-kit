@@ -1,23 +1,60 @@
 #!/usr/bin/env bash
-# vps-kit: self-contained VPS bootstrap. Files embedded below by scripts/build.sh.
+# vps-kit: self-contained VPS bootstrap. Files embedded below by build.sh.
 set -Eeuo pipefail
 umask 022
+
+PUBLIC_IP=''
+SSH_PORT=''
+while (($#)); do
+  case "$1" in
+    --ip) PUBLIC_IP="${2:?missing IP}"; shift 2 ;;
+    --ssh-port) SSH_PORT="${2:?missing SSH port}"; shift 2 ;;
+    -h|--help)
+      cat <<'HELP'
+vps-kit — подготовка Ubuntu/Debian VPS для Docker Compose-приложений.
+
+Использование: sudo bash install.sh [--ip PUBLIC_IPV4] [--ssh-port PORT]
+
+  --ip IPV4        Публичный IPv4 для SSH и адресов sslip.io.
+                   По умолчанию: сохранённый IP, иначе автоопределение.
+  --ssh-port PORT  Уже настроенный порт sshd. Скрипт не меняет SSH-порт.
+                   По умолчанию: сохранённый порт, иначе 22.
+  -h, --help       Показать эту справку.
+
+Примеры:
+  sudo bash install.sh --ip PUBLIC_IPV4
+  sudo bash install.sh --ip PUBLIC_IPV4 --ssh-port 2222
+  sudo bash install.sh   # повторная установка с сохранёнными IP/портом
+
+Устанавливает Docker/Compose, Caddy, gh, Python и vpsctl; добавляет пользователя deploy.
+Дополняет Caddyfile импортом управляемых сайтов; firewall и sshd_config не меняет.
+После установки: sudo vpsctl — главное меню; sudo vpsctl project add — мастер.
+HELP
+      exit 0 ;;
+    *) echo "Unknown option: $1" >&2; exit 2 ;;
+  esac
+done
 
 if [[ "$EUID" -ne 0 ]]; then
   echo 'Run as root: sudo bash install.sh --ip YOUR_PUBLIC_IP' >&2
   exit 1
 fi
 
-PUBLIC_IP=''
-SSH_PORT='22'
-while (($#)); do
-  case "$1" in
-    --ip) PUBLIC_IP="${2:?missing IP}"; shift 2 ;;
-    --ssh-port) SSH_PORT="${2:?missing SSH port}"; shift 2 ;;
-    -h|--help) echo 'Usage: sudo bash install.sh [--ip PUBLIC_IPV4] [--ssh-port SSH_PORT]'; exit 0 ;;
-    *) echo "Unknown option: $1" >&2; exit 2 ;;
-  esac
-done
+# Preserve explicitly configured connection settings on subsequent installs.
+SAVED_IP='-'
+SAVED_PORT='22'
+if [[ -f /etc/vps-kit/config.json ]]; then
+  read -r SAVED_IP SAVED_PORT < <(python3 - <<'PY'
+import json
+from pathlib import Path
+p = Path('/etc/vps-kit/config.json')
+config = json.loads(p.read_text()) if p.exists() else {}
+print(config.get('public_ip') or '-', config.get('ssh_port') or 22)
+PY
+)
+fi
+if [[ -z "$PUBLIC_IP" && "$SAVED_IP" != '-' ]]; then PUBLIC_IP="$SAVED_IP"; fi
+SSH_PORT="${SSH_PORT:-$SAVED_PORT}"
 
 . /etc/os-release
 if [[ "${ID:-}" != ubuntu && "${ID:-}" != debian ]]; then
@@ -125,4 +162,4 @@ systemctl enable --now caddy
 systemctl reload caddy
 
 log 'Installing CLI and restricted SSH deployment receiver'
-# BEGIN GENERATED BINARIES: scripts/build.sh inserts transparent source below.
+# BEGIN GENERATED BINARIES: build.sh inserts transparent source below.

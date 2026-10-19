@@ -41,6 +41,8 @@ compose=(docker compose -p "$slug" -f "$stage/$compose_rel" -f "$stage/.vpskit.i
 import json,sys
 config=json.load(sys.stdin)
 for service,definition in config.get("services",{}).items():
+    if definition.get("network_mode") == "host":
+        sys.exit(f"Refusing host networking on {service}; use a bridge network and loopback ports")
     for port in definition.get("ports",[]):
         host=port.get("host_ip") or "0.0.0.0"
         if host not in ("127.0.0.1", "::1"):
