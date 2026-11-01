@@ -29,6 +29,7 @@ vps-kit — подготовка Ubuntu/Debian VPS для Docker Compose-при�
 Устанавливает Docker/Compose, Caddy, gh, Python и vpsctl; добавляет пользователя deploy.
 Дополняет Caddyfile импортом управляемых сайтов; firewall и sshd_config не меняет.
 После установки: sudo vpsctl — главное меню; sudo vpsctl project add — мастер.
+Личная VPN для телефона и ПК: sudo vpsctl vpn setup (Headscale + собственный DERP).
 HELP
       exit 0 ;;
     *) echo "Unknown option: $1" >&2; exit 2 ;;
@@ -175,6 +176,9 @@ import shutil
 import subprocess
 import sys
 
+sys.path.append(os.getenv('VPSKIT_LIBEXEC', '/usr/local/libexec/vps-kit'))
+import vpskit_vpn
+
 CONFIG = Path(os.getenv('VPSKIT_CONFIG', '/etc/vps-kit/config.json'))
 PROJECT_DIR = Path(os.getenv('VPSKIT_PROJECTS', '/etc/vps-kit/projects'))
 APPS_DIR = Path(os.getenv('VPSKIT_APPS', '/opt/apps'))
@@ -243,7 +247,7 @@ def choose(title, options, default=0):
     print(f'\n{title}')
     terminal = shutil.get_terminal_size()
     if (not is_interactive() or os.name != 'posix' or os.getenv('TERM', '') in ('', 'dumb')
-            or len(options) > 9 or terminal.lines < len(options) + 4 or terminal.columns < 60):
+            or terminal.lines < len(options) + 4 or terminal.columns < 60):
         for i, label in enumerate(options, 1):
             print(f'  {i}. {label}')
         while True:
@@ -258,7 +262,7 @@ def choose(title, options, default=0):
     import termios
     import tty
 
-    print('↑/↓ или номер — выбор · Enter — продолжить · Esc — отмена')
+    print('↑/↓ — выбор · 1–9 — быстрый выбор · Enter — продолжить · Esc — отмена')
     width = shutil.get_terminal_size().columns
     selected = default
 
@@ -327,6 +331,8 @@ def normalize_repo(value):
 def slug_problem(value):
     if not VALID_SLUG.fullmatch(value):
         return 'Имя: 2–39 строчных латинских букв, цифр или дефисов; первая — буква.'
+    if value == vpskit_vpn.PROJECT:
+        return f'Имя {value} зарезервировано для VPN. Выбери другое имя проекта.'
     if (PROJECT_DIR / f'{value}.json').exists():
         return f'Проект {value} уже зарегистрирован. Выбери другое имя.'
     if (KEY_DIR / f'{value}.key').exists() or (KEY_DIR / f'{value}.key.pub').exists():
@@ -357,6 +363,9 @@ def port_problem(value):
     for p in projects():
         if p.get('port') == int(value):
             return f'Порт {value} уже занят проектом {p["slug"]}. Выбери другой.'
+    vpn = vpskit_vpn.settings()
+    if vpn and vpn['port'] == int(value):
+        return f'Порт {value} уже используется Headscale. Выбери другой.'
 
 
 def domain_problem(value):
@@ -365,6 +374,9 @@ def domain_problem(value):
     for p in projects():
         if p.get('domain') == value.lower():
             return f'Домен {value} уже используется проектом {p["slug"]}.'
+    vpn = vpskit_vpn.settings()
+    if vpn and vpn['domain'] == value.lower():
+        return f'Домен {value} уже используется Headscale.'
 
 
 def project_wizard(a):
@@ -620,6 +632,75 @@ jobs:
 '''
 
 
+def project_rm(a):
+    needs_root()
+    p = read_project(a.slug)
+    slug = p['slug']
+
+    if not a.no_confirm:
+        confirm = choose(f'Удалить проект {slug} ({p["repo"]})?', ['Удалить', 'Отмена'])
+        if confirm == 1:
+            print('Отменено.')
+            return 0
+
+    caddy = p.get('caddy', True)
+    key = KEY_DIR / f'{slug}.key'
+    pub = key.with_suffix('.key.pub')
+    site = CADDY_DIR / f'{slug}.caddy'
+    metadata = PROJECT_DIR / f'{slug}.json'
+    auth_line_pattern = f'command="{RECEIVER} {slug}",restrict '
+    base = APPS_DIR / slug
+    env = base / 'shared' / '.env'
+    caddy_reloaded = False
+
+    # Remove authorized_keys entry
+    if AUTH_KEYS.exists():
+        try:
+            lines = AUTH_KEYS.read_text().splitlines(keepends=True)
+            filtered = [l for l in lines if auth_line_pattern not in l]
+            if len(filtered) != len(lines):
+                AUTH_KEYS.write_text(''.join(filtered))
+            else:
+                print(f'  строка с ключом {slug} в authorized_keys не найдена.')
+        except OSError as e:
+            print(f'  предупреждение: не удалось обновить authorized_keys: {e}', file=sys.stderr)
+
+    # Remove SSH key pair
+    for k in [key, pub]:
+        if k.exists():
+            k.unlink()
+            print(f'  удалён ключ: {k}')
+
+    # Remove Caddy site file
+    if caddy and site.exists():
+        site.unlink()
+        print(f'  удалён сайт Caddy: {site}')
+        caddy_reloaded = True
+
+    # Remove metadata
+    if metadata.exists():
+        metadata.unlink()
+        print(f'  удалён метаданные: {metadata}')
+
+    # Remove app directory (base + all contents)
+    if base.exists():
+        try:
+            shutil.rmtree(str(base))
+            print(f'  удалён каталог приложения: {base}')
+        except OSError as e:
+            print(f'  предупреждение: не удалось удалить {base}: {e}', file=sys.stderr)
+
+    # Reload Caddy if needed
+    if caddy_reloaded:
+        try:
+            run('systemctl', 'reload', 'caddy')
+            print('  Caddy перезапущен.')
+        except subprocess.CalledProcessError as e:
+            print(f'  предупреждение: не удалось перезагрузить Caddy: {e}', file=sys.stderr)
+
+    print(f'\nПроект {slug} удалён.')
+
+
 def project_workflow(a):
     p = read_project(a.slug)
     text = workflow_text(p)
@@ -733,11 +814,12 @@ def build_parser():
     formatter = argparse.RawDescriptionHelpFormatter
     ap = argparse.ArgumentParser(
         prog='vpsctl', formatter_class=formatter,
-        description='Управление Docker Compose-приложениями на VPS. Сборка в GitHub Actions, доставка через GHCR и SSH.',
+        description='Приложения и личная VPN на VPS. Docker Compose, GitHub Actions и Headscale.',
         epilog='''Начни здесь:
   sudo vpsctl                         Главное меню: выбор стрелками и Enter
   sudo vpsctl project add             Мастер добавления проекта
   vpsctl help project add             Подробная справка по добавлению
+  sudo vpsctl vpn setup               Личная VPN для телефона и ПК
 
 После добавления проекта на VPS:
   1. sudo nano /opt/apps/myapp/shared/.env
@@ -747,7 +829,7 @@ def build_parser():
   5. vpsctl workflow myapp --output deploy-myapp.yml
 Скопируй workflow в репозиторий приложения как .github/workflows/deploy.yml.
 
-Права root: project add, github configure, registry login. Для doctor рекомендуется sudo.
+Права root: project add/rm, github configure, registry login, vpn. Для doctor рекомендуется sudo.
 Любая команда: --help или vpsctl help <команда>. Ctrl+C отменяет интерактивный ввод.
 Без терминала команды не задают вопросов; укажи все обязательные параметры.''')
     sub = ap.add_subparsers(dest='command', title='Команды', metavar='КОМАНДА')
@@ -784,6 +866,20 @@ def build_parser():
     add.add_argument('--no-caddy', action='store_true', help='не создавать сайт Caddy; маршрутизацию настроить вручную')
     add.add_argument('-i', '--interactive', action='store_true', help='открыть мастер даже при указанных параметрах; они станут начальными ответами')
     add.set_defaults(fn=project_add)
+    rm = parser(ps, 'rm', 'Удалить проект', 'Удаляет все артефакты проекта: метаданные, SSH-ключ, сайт Caddy, каталог приложения. Нужен sudo.',
+                 '''Примеры:
+sudo vpsctl project rm myapp
+sudo vpsctl project rm myapp --no-confirm
+
+Удаляет:
+  - /etc/vps-kit/projects/<slug>.json
+  - /etc/caddy/vps-kit/<slug>.caddy (если был создан)
+  - SSH-ключ из authorized_keys и пару в pending-keys
+  - /opt/apps/<slug>/ (с env и RELEASES)
+Перед удалением запрашивается подтверждение. С --no-confirm — без запроса.''', ('project', 'rm'))
+    rm.add_argument('slug', help='имя проекта на VPS')
+    rm.add_argument('--no-confirm', action='store_true', help='удалить без запроса подтверждения')
+    rm.set_defaults(fn=project_rm)
     wf = parser(sub, 'workflow', 'Сгенерировать GitHub Actions workflow',
                 'Генерирует YAML для репозитория приложения. С именем проекта без --output выводит только YAML в stdout.\nБез имени в терминале предлагает выбрать проект. Сам не делает commit/push и не запускает деплой.',
                 '''Примеры:
@@ -818,6 +914,39 @@ Docker хранит токен в конфигурации пользовате�
 Для публичных образов анонимный pull может работать без входа.''', ('registry', 'login'))
     lg.add_argument('user', nargs='?', help='логин GitHub, которому принадлежит read:packages токен')
     lg.set_defaults(fn=registry_login)
+    vpn = parser(sub, 'vpn', 'Личная VPN: Headscale + свой DERP',
+                 'Своя сеть для телефона и ПК с официальными клиентами Tailscale. Нужен sudo.',
+                 'sudo vpsctl vpn setup\nsudo vpsctl vpn status\nvpsctl help vpn setup', ('vpn',))
+    vs = vpn.add_subparsers(dest='action', title='Действия', metavar='ДЕЙСТВИЕ')
+    setup = parser(vs, 'setup', 'Настроить VPN: мастер или параметры',
+                   'Запускает Headscale с собственным DERP и HTTPS через существующий Caddy.\n'
+                   'Повторный запуск сохраняет конфигурацию, ключи и базу. Firewall и DNS настраиваются отдельно.',
+                   '''sudo vpsctl vpn setup
+sudo vpsctl vpn setup --domain vpn.example.com
+sudo vpsctl vpn setup --domain vpn.example.com --public-ip PUBLIC_IPV4 --user owner --port 18080
+
+Нужны DNS A-запись на VPS, TCP 80/443 и UDP 3478 в host/cloud firewall.
+Вместо своего домена можно указать vpn.IP-С-ДЕФИСАМИ.sslip.io.
+Без --domain в терминале открывается мастер. С параметрами вопросов нет.
+После установки: sudo vpsctl vpn connect — инструкции для телефона и ПК.
+При неуспешной проверке HTTPS возвращает код 1, сохраняя запущенный сервер и данные.''', ('vpn', 'setup'))
+    setup.add_argument('--domain', help='публичный DNS-домен без https:// и пути')
+    setup.add_argument('--public-ip', help='публичный IPv4 VPS; по умолчанию IP из install.sh')
+    setup.add_argument('--user', help='имя владельца устройств (по умолчанию owner)')
+    setup.add_argument('--port', type=int, help='локальный TCP-порт Headscale (по умолчанию 18080)')
+    setup.add_argument('-i', '--interactive', action='store_true', help='открыть мастер с указанными начальными ответами')
+    setup.set_defaults(fn=lambda a: vpskit_vpn.setup(a, sys.modules[__name__]))
+    for name, title, examples in [
+        ('status', 'Контейнер, устройства, VPN-адреса и HTTPS', 'sudo vpsctl vpn status'),
+        ('key', 'Создать одноразовый ключ на 1 час', 'sudo vpsctl vpn key'),
+        ('register', 'Подтвердить устройство по Auth ID', 'sudo vpsctl vpn register AUTH_ID'),
+        ('connect', 'Инструкции для Windows, Android и iPhone', 'sudo vpsctl vpn connect'),
+        ('logs', 'Последние 100 строк журнала Headscale', 'sudo vpsctl vpn logs'),
+    ]:
+        vp = parser(vs, name, title, title + '. Нужен sudo.', examples, ('vpn', name))
+        if name == 'register':
+            vp.add_argument('auth_id', help='Auth ID со страницы регистрации устройства')
+        vp.set_defaults(fn=lambda a, name=name: getattr(vpskit_vpn, name)(a, sys.modules[__name__]))
     st = parser(sub, 'status', 'Показать проекты и запущенные контейнеры',
                 'Показывает зарегистрированные приложения: репозиторий, домен и порт; затем docker ps.',
                 'vpsctl status\nsudo vpsctl status   # если текущий пользователь не имеет доступа к Docker', ('status',))
@@ -847,8 +976,9 @@ def main_menu(ap):
     print('vps-kit — приложения на твоём VPS')
     while True:
         action = choose('Что сделать?', ['Добавить проект', 'Настроить GitHub Secrets', 'Сохранить workflow',
-                                         'Войти в GHCR', 'Показать состояние', 'Проверить VPS', 'Справка', 'Выход'])
-        if action == 7:
+                                         'Войти в GHCR', 'Показать состояние', 'Проверить VPS', 'Справка', 'Удалить проект',
+                                         'Настроить личную VPN (Headscale)', 'Выход'])
+        if action == 9:
             return 0
         try:
             if action == 0:
@@ -875,6 +1005,12 @@ def main_menu(ap):
                 doctor(None)
             elif action == 6:
                 ap.print_help()
+            elif action == 7:
+                slug = select_project()
+                project_rm(argparse.Namespace(slug=slug, no_confirm=False))
+            elif action == 8:
+                vpskit_vpn.setup(argparse.Namespace(domain=None, public_ip=None, user=None, port=None, interactive=True),
+                                 sys.modules[__name__])
         except SystemExit as e:
             print(e, file=sys.stderr)
         except (WizardCancelled, EOFError, KeyboardInterrupt):
@@ -903,6 +1039,11 @@ def main():
                 ap.error('нужны имя проекта, --repo и --port. Для мастера в терминале: sudo vpsctl project add')
             args.compose = args.compose or 'compose.yaml'
             args.branch = args.branch or 'main'
+        elif args.command == 'project' and args.action == 'rm':
+            if args.slug is None:
+                if not is_interactive():
+                    ap.error('укажи имя проекта. Список: vpsctl status')
+                args.slug = select_project()
         elif args.command == 'workflow' or (args.command == 'github' and args.action == 'configure'):
             if args.slug is None:
                 if not is_interactive():
@@ -1061,11 +1202,368 @@ for directory in sorted(directory_modes, key=lambda p: len(p.parts), reverse=Tru
 print(f'extracted {count} entries, {total} bytes', file=sys.stderr)
 
 EXTRACTOR_SCRIPT
+cat > /usr/local/libexec/vps-kit/vpskit_vpn.py <<'VPN_SCRIPT'
+"""Personal Headscale deployment, using vps-kit's existing Docker and Caddy."""
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import socket
+import subprocess
+import tempfile
+
+VERSION = '0.29.7'
+PROJECT = 'vps-kit-headscale'
+VPN_DIR = Path(os.getenv('VPSKIT_VPN_DIR', '/opt/vps-kit/headscale'))
+CADDYFILE = Path(os.getenv('VPSKIT_CADDYFILE', '/etc/caddy/Caddyfile'))
+SITE_NAME = 'vps-kit-headscale.caddy'
+
+
+def fail(message):
+    raise SystemExit(f'Ошибка: {message}')
+
+
+def settings():
+    path = VPN_DIR / 'settings.json'
+    if not path.exists():
+        return None
+    try:
+        s = json.loads(path.read_text())
+        if (not isinstance(s, dict) or not all(isinstance(s.get(key), str)
+                for key in ('domain', 'public_ip', 'user', 'version'))
+                or type(s.get('port')) is not int):
+            raise ValueError('missing settings')
+        return s
+    except (ValueError, TypeError):
+        fail(f'не удалось прочитать {path}. Восстанови настройки из резервной копии.')
+
+
+def domain_problem(value):
+    if len(value) > 253 or '.' not in value or any(
+            not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', part)
+            for part in value.lower().split('.')):
+        return 'Нужен полный DNS-домен без https://, порта и пути.'
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        return None
+    return 'Укажи DNS-домен, а не IP: клиентам нужен HTTPS-сертификат.'
+
+
+def ip_problem(value):
+    try:
+        ip = ipaddress.ip_address(value)
+        if ip.version == 4 and ip.is_global:
+            return None
+    except ValueError:
+        pass
+    return 'Нужен публичный IPv4 VPS.'
+
+
+def user_problem(value):
+    if not re.fullmatch(r'[a-z][a-z0-9-]{0,31}', value):
+        return 'Имя пользователя: 1–32 строчных латинских букв, цифр или дефисов; первая — буква.'
+
+
+def port_problem(value):
+    if not str(value).isascii() or not str(value).isdigit() or not 1024 <= int(value) <= 65535:
+        return 'Порт должен быть числом от 1024 до 65535.'
+
+
+def config_text(s):
+    # JSON is also valid YAML and avoids an additional runtime dependency.
+    return json.dumps({
+        'server_url': f'https://{s["domain"]}',
+        'listen_addr': '0.0.0.0:8080',
+        'metrics_listen_addr': '127.0.0.1:9090',
+        'grpc_listen_addr': '127.0.0.1:50443',
+        'noise': {'private_key_path': '/var/lib/headscale/noise_private.key'},
+        'prefixes': {'v4': '100.64.0.0/10', 'v6': 'fd7a:115c:a1e0::/48'},
+        'derp': {
+            'server': {
+                'enabled': True, 'region_id': 999, 'region_code': 'vps',
+                'region_name': 'My VPS', 'verify_clients': True,
+                'stun_listen_addr': '0.0.0.0:3478',
+                'private_key_path': '/var/lib/headscale/derp_server_private.key',
+                'automatically_add_embedded_derp_region': True,
+                'ipv4': s['public_ip'],
+            },
+            'urls': [], 'paths': [], 'auto_update_enabled': False,
+        },
+        'disable_check_updates': True,
+        'database': {'type': 'sqlite', 'sqlite': {
+            'path': '/var/lib/headscale/db.sqlite', 'write_ahead_log': True,
+        }},
+        'dns': {'magic_dns': True, 'base_domain': 'tailnet.internal',
+                'override_local_dns': False, 'nameservers': {'global': [], 'split': {}}},
+        'unix_socket': '/var/run/headscale/headscale.sock',
+        'unix_socket_permission': '0770',
+        'logtail': {'enabled': False},
+    }, indent=2) + '\n'
+
+
+def compose_text(s):
+    return json.dumps({'services': {'headscale': {
+        'image': f'ghcr.io/juanfont/headscale:{VERSION}',
+        'command': ['serve'], 'restart': 'unless-stopped', 'read_only': True,
+        'tmpfs': ['/var/run/headscale'],
+        'volumes': ['./config:/etc/headscale:ro', './data:/var/lib/headscale'],
+        'ports': [f'127.0.0.1:{s["port"]}:8080', '3478:3478/udp'],
+        'healthcheck': {'test': ['CMD', 'headscale', 'health'], 'interval': '3s',
+                        'timeout': '3s', 'retries': 10, 'start_period': '5s'},
+        'logging': {'driver': 'json-file', 'options': {'max-size': '10m', 'max-file': '3'}},
+    }}}, indent=2) + '\n'
+
+
+def site_text(s):
+    return (f'http://{s["domain"]} {{\n'
+            '    handle /generate_204 {\n        respond 204\n    }\n'
+            '    handle {\n        redir https://{host}{uri}\n    }\n}\n'
+            f'{s["domain"]} {{\n    reverse_proxy 127.0.0.1:{s["port"]}\n}}\n')
+
+
+def command(*args, capture=False, check=True):
+    result = subprocess.run(args, text=True, capture_output=capture, check=False)
+    if check and result.returncode:
+        if capture:
+            fail((result.stderr or result.stdout).strip() or f'команда {args[0]} завершилась с ошибкой')
+        raise subprocess.CalledProcessError(result.returncode, args)
+    return result
+
+
+def compose(*args, **kwargs):
+    return command('docker', 'compose', '--project-name', PROJECT,
+                   '--file', str(VPN_DIR / 'compose.yaml'), *args, **kwargs)
+
+
+def headscale(*args, **kwargs):
+    return compose('exec', '-T', 'headscale', 'headscale', *args, **kwargs)
+
+
+def ensure_user(s):
+    users = json.loads(headscale('users', 'list', '--output', 'json', capture=True).stdout)
+    for user in users or []:
+        if user['name'] == s['user']:
+            return user['id']
+    user = json.loads(headscale('users', 'create', s['user'], '--output', 'json', capture=True).stdout)
+    return user['id']
+
+
+def check_ports(port):
+    for kind, address, label in [(socket.SOCK_STREAM, ('127.0.0.1', port), f'TCP {port}'),
+                                 (socket.SOCK_DGRAM, ('0.0.0.0', 3478), 'UDP 3478')]:
+        with socket.socket(socket.AF_INET, kind) as listener:
+            try:
+                listener.bind(address)
+            except OSError:
+                fail(f'{label} уже занят. Освободи порт перед установкой VPN.')
+
+
+def check_site(s, caddy_dir):
+    if not CADDYFILE.is_file() or f'import {caddy_dir}/*.caddy' not in CADDYFILE.read_text():
+        fail('Caddyfile не импортирует сайты vps-kit. Сначала повтори установку install.sh.')
+    site = caddy_dir / SITE_NAME
+    expected = site_text(s)
+    if site.exists() and site.read_text() != expected:
+        fail(f'{site} уже существует с другой конфигурацией; файл не перезаписан.')
+    domain = re.compile(r'(?<![a-zA-Z0-9.-])' + re.escape(s['domain']) + r'(?![a-zA-Z0-9.-])')
+    for path in [CADDYFILE, *caddy_dir.glob('*.caddy')]:
+        if path != site and domain.search(path.read_text()):
+            fail(f'домен {s["domain"]} уже встречается в {path}. Выбери отдельный поддомен.')
+    return site
+
+
+def validate(s, cli):
+    for validator, value in [(domain_problem, s['domain']), (ip_problem, s['public_ip']),
+                              (user_problem, s['user']), (port_problem, s['port'])]:
+        message = validator(value)
+        if message:
+            fail(message)
+    if s['domain'] == 'tailnet.internal':
+        fail('tailnet.internal зарезервирован для имён устройств. Выбери публичный домен.')
+    for p in cli.projects():
+        if p['slug'] == PROJECT or p.get('domain') == s['domain'] or p.get('port') == s['port']:
+            fail(f'имя Compose-проекта, домен или порт уже используется проектом {p["slug"]}.')
+
+
+def wizard(a, cli, previous):
+    cli.require_terminal()
+    server = cli.load_json(cli.CONFIG)
+    print('\nНастройка личной VPN: Headscale + свой DERP + HTTPS через Caddy.')
+    print('Enter принимает значение в скобках. До подтверждения файлы не создаются.')
+    defaults = previous or {}
+    while True:
+        a.public_ip = cli.ask('Публичный IPv4 VPS', a.public_ip or defaults.get('public_ip') or server.get('public_ip'), ip_problem)
+        a.domain = cli.ask('Домен VPN (DNS A-запись на VPS)', a.domain or defaults.get('domain') or
+                           f'vpn.{a.public_ip.replace(".", "-")}.sslip.io', domain_problem).lower()
+        a.user = cli.ask('Имя владельца VPN', a.user or defaults.get('user') or 'owner', user_problem)
+        a.port = int(cli.ask('Локальный порт Headscale', a.port or defaults.get('port') or 18080, port_problem))
+        print(f'\nАдрес: https://{a.domain}; IPv4: {a.public_ip}; пользователь: {a.user}')
+        print(f'Headscale: 127.0.0.1:{a.port}; свой DERP/STUN: TCP 443 и UDP 3478.')
+        print('Открой TCP 80/443 и UDP 3478 в firewall VPS/провайдера; DNS должен указывать на VPS.')
+        choice = cli.choose('Применить настройки?', ['Настроить VPN', 'Изменить ответы', 'Отмена'])
+        if choice == 0:
+            return True
+        if choice == 2:
+            return False
+
+
+def setup(a, cli):
+    cli.needs_root()
+    previous = settings()
+    if a.interactive or (not a.domain and cli.is_interactive() and not previous):
+        if not wizard(a, cli, previous):
+            print('Настройка VPN отменена. Ничего не создано.')
+            return
+    if previous:
+        for key in ('domain', 'public_ip', 'port', 'user'):
+            given = getattr(a, key)
+            if key == 'domain' and given:
+                given = given.lower()
+            if given is not None and given != previous[key]:
+                fail(f'VPN уже настроена с {key}={previous[key]}. Настройки и база не перезаписаны.')
+        s = previous
+        for name in ('compose.yaml', 'config/config.yaml', 'data'):
+            if not (VPN_DIR / name).exists():
+                fail(f'отсутствует {VPN_DIR / name}. Восстанови файл из резервной копии.')
+    else:
+        server = cli.load_json(cli.CONFIG)
+        s = {'domain': (a.domain or '').lower(), 'public_ip': a.public_ip or server.get('public_ip') or '',
+             'port': a.port if a.port is not None else 18080, 'user': a.user if a.user is not None else 'owner', 'version': VERSION}
+        if not s['domain']:
+            fail('укажи --domain vpn.example.com или запусти sudo vpsctl vpn setup в терминале.')
+    validate(s, cli)
+    for tool in ('docker', 'caddy', 'systemctl', 'curl'):
+        if not shutil.which(tool):
+            fail(f'не найден {tool}. Сначала установи vps-kit через install.sh.')
+    command('docker', 'info', capture=True)
+    command('docker', 'compose', 'version', capture=True)
+    site = check_site(s, cli.CADDY_DIR)
+    if not previous:
+        if VPN_DIR.exists():
+            fail(f'{VPN_DIR} уже существует без settings.json; проверь каталог вручную.')
+        containers = command('docker', 'ps', '-aq', '--filter', f'label=com.docker.compose.project={PROJECT}', capture=True)
+        if containers.stdout.strip():
+            fail(f'Compose-проект {PROJECT} уже существует без метаданных vps-kit.')
+        check_ports(s['port'])
+        VPN_DIR.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='.headscale-', dir=VPN_DIR.parent) as tmp:
+            stage = Path(tmp) / 'headscale'
+            stage.mkdir(mode=0o700)
+            (stage / 'config').mkdir(mode=0o755)
+            (stage / 'data').mkdir(mode=0o700)
+            for name, data in [('settings.json', json.dumps(s, indent=2) + '\n'),
+                                ('compose.yaml', compose_text(s)), ('config/config.yaml', config_text(s))]:
+                path = stage / name
+                path.write_text(data)
+                path.chmod(0o600)
+            stage.rename(VPN_DIR)
+    created_site = False
+    reload_attempted = False
+    try:
+        if not site.exists():
+            cli.CADDY_DIR.mkdir(parents=True, exist_ok=True)
+            cli.write_secret(site, site_text(s))
+            created_site = True
+            site.chmod(0o644)
+        command('caddy', 'validate', '--config', str(CADDYFILE), capture=True)
+        print('Проверка и запуск Headscale…', flush=True)
+        compose('pull')
+        compose('run', '--rm', '--no-deps', 'headscale', 'configtest')
+        compose('up', '-d', '--wait', '--wait-timeout', '45')
+        ensure_user(s)
+        reload_attempted = True
+        command('systemctl', 'reload', 'caddy')
+    except (Exception, SystemExit, KeyboardInterrupt):
+        if created_site:
+            site.unlink(missing_ok=True)
+            if reload_attempted:
+                command('systemctl', 'reload', 'caddy', check=False)
+        print(f'Конфигурация и данные сохранены в {VPN_DIR}. Устрани ошибку и повтори: sudo vpsctl vpn setup', flush=True)
+        raise
+    print('\nHeadscale запущен. Проверяю публичный HTTPS…', flush=True)
+    result = command('curl', '--fail', '--silent', '--show-error', '--max-time', '15',
+                     f'https://{s["domain"]}/health', capture=True, check=False)
+    instructions(s)
+    if result.returncode:
+        print(f'HTTPS пока не подтверждён: {result.stderr.strip()}')
+        print('Проверь DNS, выпуск сертификата и firewall. Повтори: sudo vpsctl vpn status')
+        return 1
+    print('Публичный HTTPS /health: OK. Связь телефон ↔ ПК проверяется после регистрации устройств.')
+
+
+def instructions(s):
+    print(f'\nСервер VPN: https://{s["domain"]}')
+    print('На VPS нужны TCP 80/443 и UDP 3478 в host/cloud firewall; DNS A-запись должна указывать на VPS.')
+    print('Установи Tailscale на ПК и телефон (Android/iOS).')
+    print(f'На Windows/Linux: tailscale login --login-server https://{s["domain"]}')
+    print('На Windows включи Preferences → Run unattended для доступа до входа пользователя.')
+    print('Android: Settings → Accounts → ⋮ → Use an alternate server.')
+    print('iPhone: Log in… → меню → Use custom coordination server.')
+    print('В приложении укажи адрес сервера выше. После входа откроется страница регистрации.')
+    print('Скопируй Auth ID с этой страницы и подтверди каждое устройство на VPS:')
+    print('  sudo vpsctl vpn register AUTH_ID')
+    print('Или создай отдельный одноразовый ключ на 1 час для каждого устройства:')
+    print('  sudo vpsctl vpn key')
+    print('Список устройств и их VPN-адреса: sudo vpsctl vpn status')
+    print('Проверка с ПК: tailscale status; tailscale ping ИМЯ_ИЛИ_VPN_IP')
+    print('Для экрана ПК настрой RDP/другой сервер удалённого рабочего стола и клиент на телефоне.')
+    print('Подключайся к VPN-IP ПК; разреши нужный сервис в firewall ПК для VPN-сети.')
+    print('ПК должен быть включён и не спать. VPN не включает удалённый рабочий стол автоматически.')
+
+
+def installed(cli):
+    cli.needs_root()
+    s = settings()
+    if not s:
+        fail('VPN ещё не настроена. Запусти: sudo vpsctl vpn setup')
+    return s
+
+
+def register(a, cli):
+    s = installed(cli)
+    if not re.fullmatch(r'[A-Za-z0-9_-]{1,256}', a.auth_id):
+        fail('некорректный Auth ID; скопируй его со страницы регистрации.')
+    headscale('auth', 'register', '--user', s['user'], '--auth-id', a.auth_id)
+
+
+def key(_, cli):
+    s = installed(cli)
+    uid = ensure_user(s)
+    print('Одноразовый ключ, действителен 1 час. Используй для одного устройства:', flush=True)
+    headscale('preauthkeys', 'create', '--user', str(uid), '--expiration', '1h')
+
+
+def status(_, cli):
+    s = installed(cli)
+    failed = False
+    for args in [('ps',), ('exec', '-T', 'headscale', 'headscale', 'nodes', 'list')]:
+        failed |= compose(*args, check=False).returncode != 0
+    result = command('curl', '--fail', '--silent', '--show-error', '--max-time', '15',
+                     f'https://{s["domain"]}/health', capture=True, check=False)
+    print(f'HTTPS /health: {"OK" if result.returncode == 0 else result.stderr.strip()}')
+    print('STUN UDP 3478, прямое соединение и DERP проверяй на устройствах через tailscale netcheck/ping.')
+    return int(failed or result.returncode != 0)
+
+
+def logs(_, cli):
+    installed(cli)
+    compose('logs', '--tail', '100', 'headscale')
+
+
+def connect(_, cli):
+    instructions(installed(cli))
+
+VPN_SCRIPT
 
 chmod 755 /usr/local/bin/vpsctl /usr/local/libexec/vps-kit/receive-deploy /usr/local/libexec/vps-kit/extract-bundle.py
+chmod 644 /usr/local/libexec/vps-kit/vpskit_vpn.py
 log 'Done. No existing application containers, Docker volumes, .env files or GitHub runners were changed.'
 log 'Next: sudo vpsctl — главное меню; sudo vpsctl project add — мастер добавления проекта'
 log 'Help: vpsctl --help; vpsctl help project add'
+log 'Personal VPN: sudo vpsctl vpn setup — Headscale + HTTPS + own DERP for phone/PC'
 log 'Then: sudo gh auth login --web && sudo vpsctl github configure app'
-log 'Security: only 80/443 and your SSH port should be public; configure the host/cloud firewall yourself.'
+log 'Firewall: TCP 80/443 and your SSH port; personal VPN additionally needs UDP 3478. Configure host/cloud rules yourself.'
 log 'Warning: deploy user has Docker access (effectively root-level). Protect GitHub deployment secrets.'

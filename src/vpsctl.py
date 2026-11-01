@@ -9,6 +9,9 @@ import shutil
 import subprocess
 import sys
 
+sys.path.append(os.getenv('VPSKIT_LIBEXEC', '/usr/local/libexec/vps-kit'))
+import vpskit_vpn
+
 CONFIG = Path(os.getenv('VPSKIT_CONFIG', '/etc/vps-kit/config.json'))
 PROJECT_DIR = Path(os.getenv('VPSKIT_PROJECTS', '/etc/vps-kit/projects'))
 APPS_DIR = Path(os.getenv('VPSKIT_APPS', '/opt/apps'))
@@ -77,7 +80,7 @@ def choose(title, options, default=0):
     print(f'\n{title}')
     terminal = shutil.get_terminal_size()
     if (not is_interactive() or os.name != 'posix' or os.getenv('TERM', '') in ('', 'dumb')
-            or len(options) > 9 or terminal.lines < len(options) + 4 or terminal.columns < 60):
+            or terminal.lines < len(options) + 4 or terminal.columns < 60):
         for i, label in enumerate(options, 1):
             print(f'  {i}. {label}')
         while True:
@@ -92,7 +95,7 @@ def choose(title, options, default=0):
     import termios
     import tty
 
-    print('↑/↓ или номер — выбор · Enter — продолжить · Esc — отмена')
+    print('↑/↓ — выбор · 1–9 — быстрый выбор · Enter — продолжить · Esc — отмена')
     width = shutil.get_terminal_size().columns
     selected = default
 
@@ -161,6 +164,8 @@ def normalize_repo(value):
 def slug_problem(value):
     if not VALID_SLUG.fullmatch(value):
         return 'Имя: 2–39 строчных латинских букв, цифр или дефисов; первая — буква.'
+    if value == vpskit_vpn.PROJECT:
+        return f'Имя {value} зарезервировано для VPN. Выбери другое имя проекта.'
     if (PROJECT_DIR / f'{value}.json').exists():
         return f'Проект {value} уже зарегистрирован. Выбери другое имя.'
     if (KEY_DIR / f'{value}.key').exists() or (KEY_DIR / f'{value}.key.pub').exists():
@@ -191,6 +196,9 @@ def port_problem(value):
     for p in projects():
         if p.get('port') == int(value):
             return f'Порт {value} уже занят проектом {p["slug"]}. Выбери другой.'
+    vpn = vpskit_vpn.settings()
+    if vpn and vpn['port'] == int(value):
+        return f'Порт {value} уже используется Headscale. Выбери другой.'
 
 
 def domain_problem(value):
@@ -199,6 +207,9 @@ def domain_problem(value):
     for p in projects():
         if p.get('domain') == value.lower():
             return f'Домен {value} уже используется проектом {p["slug"]}.'
+    vpn = vpskit_vpn.settings()
+    if vpn and vpn['domain'] == value.lower():
+        return f'Домен {value} уже используется Headscale.'
 
 
 def project_wizard(a):
@@ -636,11 +647,12 @@ def build_parser():
     formatter = argparse.RawDescriptionHelpFormatter
     ap = argparse.ArgumentParser(
         prog='vpsctl', formatter_class=formatter,
-        description='Управление Docker Compose-приложениями на VPS. Сборка в GitHub Actions, доставка через GHCR и SSH.',
+        description='Приложения и личная VPN на VPS. Docker Compose, GitHub Actions и Headscale.',
         epilog='''Начни здесь:
   sudo vpsctl                         Главное меню: выбор стрелками и Enter
   sudo vpsctl project add             Мастер добавления проекта
   vpsctl help project add             Подробная справка по добавлению
+  sudo vpsctl vpn setup               Личная VPN для телефона и ПК
 
 После добавления проекта на VPS:
   1. sudo nano /opt/apps/myapp/shared/.env
@@ -650,7 +662,7 @@ def build_parser():
   5. vpsctl workflow myapp --output deploy-myapp.yml
 Скопируй workflow в репозиторий приложения как .github/workflows/deploy.yml.
 
-Права root: project add, github configure, registry login. Для doctor рекомендуется sudo.
+Права root: project add/rm, github configure, registry login, vpn. Для doctor рекомендуется sudo.
 Любая команда: --help или vpsctl help <команда>. Ctrl+C отменяет интерактивный ввод.
 Без терминала команды не задают вопросов; укажи все обязательные параметры.''')
     sub = ap.add_subparsers(dest='command', title='Команды', metavar='КОМАНДА')
@@ -735,6 +747,39 @@ Docker хранит токен в конфигурации пользовате�
 Для публичных образов анонимный pull может работать без входа.''', ('registry', 'login'))
     lg.add_argument('user', nargs='?', help='логин GitHub, которому принадлежит read:packages токен')
     lg.set_defaults(fn=registry_login)
+    vpn = parser(sub, 'vpn', 'Личная VPN: Headscale + свой DERP',
+                 'Своя сеть для телефона и ПК с официальными клиентами Tailscale. Нужен sudo.',
+                 'sudo vpsctl vpn setup\nsudo vpsctl vpn status\nvpsctl help vpn setup', ('vpn',))
+    vs = vpn.add_subparsers(dest='action', title='Действия', metavar='ДЕЙСТВИЕ')
+    setup = parser(vs, 'setup', 'Настроить VPN: мастер или параметры',
+                   'Запускает Headscale с собственным DERP и HTTPS через существующий Caddy.\n'
+                   'Повторный запуск сохраняет конфигурацию, ключи и базу. Firewall и DNS настраиваются отдельно.',
+                   '''sudo vpsctl vpn setup
+sudo vpsctl vpn setup --domain vpn.example.com
+sudo vpsctl vpn setup --domain vpn.example.com --public-ip PUBLIC_IPV4 --user owner --port 18080
+
+Нужны DNS A-запись на VPS, TCP 80/443 и UDP 3478 в host/cloud firewall.
+Вместо своего домена можно указать vpn.IP-С-ДЕФИСАМИ.sslip.io.
+Без --domain в терминале открывается мастер. С параметрами вопросов нет.
+После установки: sudo vpsctl vpn connect — инструкции для телефона и ПК.
+При неуспешной проверке HTTPS возвращает код 1, сохраняя запущенный сервер и данные.''', ('vpn', 'setup'))
+    setup.add_argument('--domain', help='публичный DNS-домен без https:// и пути')
+    setup.add_argument('--public-ip', help='публичный IPv4 VPS; по умолчанию IP из install.sh')
+    setup.add_argument('--user', help='имя владельца устройств (по умолчанию owner)')
+    setup.add_argument('--port', type=int, help='локальный TCP-порт Headscale (по умолчанию 18080)')
+    setup.add_argument('-i', '--interactive', action='store_true', help='открыть мастер с указанными начальными ответами')
+    setup.set_defaults(fn=lambda a: vpskit_vpn.setup(a, sys.modules[__name__]))
+    for name, title, examples in [
+        ('status', 'Контейнер, устройства, VPN-адреса и HTTPS', 'sudo vpsctl vpn status'),
+        ('key', 'Создать одноразовый ключ на 1 час', 'sudo vpsctl vpn key'),
+        ('register', 'Подтвердить устройство по Auth ID', 'sudo vpsctl vpn register AUTH_ID'),
+        ('connect', 'Инструкции для Windows, Android и iPhone', 'sudo vpsctl vpn connect'),
+        ('logs', 'Последние 100 строк журнала Headscale', 'sudo vpsctl vpn logs'),
+    ]:
+        vp = parser(vs, name, title, title + '. Нужен sudo.', examples, ('vpn', name))
+        if name == 'register':
+            vp.add_argument('auth_id', help='Auth ID со страницы регистрации устройства')
+        vp.set_defaults(fn=lambda a, name=name: getattr(vpskit_vpn, name)(a, sys.modules[__name__]))
     st = parser(sub, 'status', 'Показать проекты и запущенные контейнеры',
                 'Показывает зарегистрированные приложения: репозиторий, домен и порт; затем docker ps.',
                 'vpsctl status\nsudo vpsctl status   # если текущий пользователь не имеет доступа к Docker', ('status',))
@@ -764,8 +809,9 @@ def main_menu(ap):
     print('vps-kit — приложения на твоём VPS')
     while True:
         action = choose('Что сделать?', ['Добавить проект', 'Настроить GitHub Secrets', 'Сохранить workflow',
-                                         'Войти в GHCR', 'Показать состояние', 'Проверить VPS', 'Справка', 'Удалить проект', 'Выход'])
-        if action == 8:
+                                         'Войти в GHCR', 'Показать состояние', 'Проверить VPS', 'Справка', 'Удалить проект',
+                                         'Настроить личную VPN (Headscale)', 'Выход'])
+        if action == 9:
             return 0
         try:
             if action == 0:
@@ -795,6 +841,9 @@ def main_menu(ap):
             elif action == 7:
                 slug = select_project()
                 project_rm(argparse.Namespace(slug=slug, no_confirm=False))
+            elif action == 8:
+                vpskit_vpn.setup(argparse.Namespace(domain=None, public_ip=None, user=None, port=None, interactive=True),
+                                 sys.modules[__name__])
         except SystemExit as e:
             print(e, file=sys.stderr)
         except (WizardCancelled, EOFError, KeyboardInterrupt):
