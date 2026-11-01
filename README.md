@@ -4,6 +4,8 @@
 
 Сборка происходит в GitHub-hosted Actions. Готовые образы отправляются в GitHub Container Registry (GHCR), конфигурация — на VPS по SSH. На VPS выполняются скачивание образов и `docker compose up`; собственный Actions runner не нужен.
 
+Для подключения телефона к ПК через собственный VPS есть **`sudo vpsctl vpn setup`**: мастер настраивает Headscale, HTTPS через Caddy и свой DERP. Репозиторий приложения и GitHub Secrets для VPN не нужны. Установка, подключение Windows/Android/iPhone и восстановление описаны в [HEADSCALE.md](HEADSCALE.md).
+
 ## С чего начать
 
 Для нового сервера пройди шаги ниже. Если приложения уже работают на VPS, сначала прочитай [раздел о переносе](#уже-работающий-vps).
@@ -25,7 +27,7 @@
 Выполняй **на VPS**. Скачай `install.sh`, просмотри его и затем запусти:
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/MorkovnySok/vps-kit/main/install.sh
+curl -fsSLO https://raw.githubusercontent.com/MorkovnySok/vps-kit/master/install.sh
 less install.sh
 sudo bash install.sh --ip PUBLIC_IPV4
 ```
@@ -214,6 +216,11 @@ git push
 | `vpsctl workflow [NAME] --output FILE` | Сохраняет workflow | Чтение метаданных, запись в выбранный файл |
 | `vpsctl status` | Показывает проекты и `docker ps` | Для контейнеров нужен доступ к Docker |
 | `sudo vpsctl doctor` | Проверяет Docker, Compose, Caddy и GHCR | Рекомендуется root |
+| `sudo vpsctl vpn setup` | Настраивает Headscale, HTTPS и собственный DERP | root |
+| `sudo vpsctl vpn register AUTH_ID` | Подтверждает устройство в своей VPN | root |
+| `sudo vpsctl vpn key` | Создаёт одноразовый ключ регистрации на 1 час | root |
+| `sudo vpsctl vpn status` | Показывает устройства, VPN-IP и проверяет HTTPS | root |
+| `sudo vpsctl vpn connect` / `logs` | Инструкции подключения / журнал VPN | root |
 | `vpsctl help [COMMAND ...]` | Показывает подробную справку | Без root |
 
 Без имени `workflow` и `github configure` предлагают выбрать проект в терминале; `registry login` спрашивает логин. Квадратные скобки в таблице означают необязательный аргумент, их вводить не нужно.
@@ -312,6 +319,15 @@ python3 -m pip install -r requirements-dev.txt
 bash build.sh
 python3 tests/test_offline.py
 python3 tests/test_cli.py -v
+python3 tests/test_vpn.py -v
 ```
 
-Тесты работают во временных каталогах с подменёнными системными командами; не устанавливают пакеты, не перезапускают сервисы и не обращаются к GitHub. Проверяют мастер в псевдотерминале, отмену, совместимость команд, восстановление после ошибок регистрации и ограничения деплоя. Лицензия: [MIT](LICENSE).
+Офлайн-тесты работают во временных каталогах с подменёнными системными командами; не устанавливают пакеты, не перезапускают сервисы и не обращаются к GitHub. Проверяют мастер в псевдотерминале, отмену, совместимость команд, восстановление после ошибок регистрации, ограничения деплоя и настройку VPN.
+
+Дополнительная проверка требует работающего Docker и скачивает образы Headscale/Caddy. Она запускает временный Headscale, проверяет health/STUN, пользователей, ключи и сохранение идентичности после перезапуска, затем удаляет тестовые контейнеры:
+
+```bash
+VPSKIT_RUN_DOCKER_TESTS=1 python3 tests/test_vpn_runtime.py -v
+```
+
+Публичный TLS, соединение телефона с ПК и установка пакетов на реальном VPS этой проверкой не подтверждаются. Лицензия: [MIT](LICENSE).

@@ -29,6 +29,7 @@ vps-kit — подготовка Ubuntu/Debian VPS для Docker Compose-при�
 Устанавливает Docker/Compose, Caddy, gh, Python и vpsctl; добавляет пользователя deploy.
 Дополняет Caddyfile импортом управляемых сайтов; firewall и sshd_config не меняет.
 После установки: sudo vpsctl — главное меню; sudo vpsctl project add — мастер.
+Личная VPN для телефона и ПК: sudo vpsctl vpn setup (Headscale + собственный DERP).
 HELP
       exit 0 ;;
     *) echo "Unknown option: $1" >&2; exit 2 ;;
